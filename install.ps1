@@ -33,6 +33,79 @@ function Download-WithRetry {
     return $false
 }
 
+function Get-ClaudeModels {
+    param([string]$BaseUrl, [string]$Token)
+
+    $endpoint = $BaseUrl.TrimEnd('/') + '/v1/models'
+    $headers = @{ Authorization = "Bearer $Token"; 'anthropic-version' = '2023-06-01' }
+    $models = @()
+    $lastId = $null
+    for ($page = 0; $page -lt 20; $page++) {
+        $uri = $endpoint
+        if ($lastId) { $uri += '?after_id=' + [uri]::EscapeDataString($lastId) }
+        $response = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get -TimeoutSec 20 -ErrorAction Stop
+        if ($response.success -eq $false -or -not $response.data) {
+            throw '模型列表为空或返回格式不正确'
+        }
+        $models += @($response.data)
+        if (-not $response.has_more) { return $models }
+        $nextId = [string]$response.last_id
+        if (-not $nextId -or $nextId -eq $lastId) { throw '模型列表分页信息不正确' }
+        $lastId = $nextId
+    }
+    throw '模型列表分页数量超出限制'
+}
+
+function Select-LatestClaudeModel {
+    param([object[]]$Models, [string]$Family)
+
+    $candidates = foreach ($entry in $Models) {
+        $id = [string]$entry.id
+        $name = $id -replace '(?i)\[1m\]$', ''
+        # 只选正式模型，跳过 -thinking 等变体；同时兼容旧版 claude-3-5-sonnet 命名。
+        $pattern = '^claude-' + $Family + '-(?<major>\d+)(?:-(?<minor>\d{1,3}))?(?:-(?<date>\d{8}))?$'
+        $legacyPattern = '^claude-(?<major>\d+)(?:-(?<minor>\d{1,3}))?-' + $Family + '(?:-(?<date>\d{8}))?$'
+        if ($name -match $pattern -or $name -match $legacyPattern) {
+            $major = [int]$Matches.major
+            $minor = if ($Matches.minor) { [int]$Matches.minor } else { 0 }
+            $date = if ($Matches.date) { [long]$Matches.date } else { 0 }
+            $version = [version]("$major.$minor")
+            # [1M] 只声明上下文能力，不能给不支持的模型扩容。
+            $supports1M = ($Family -eq 'fable' -and $major -ge 5) -or
+                ($Family -in @('opus', 'sonnet') -and $version -ge [version]'4.6')
+            if ($entry.context_window -ge 1000000 -or $entry.max_input_tokens -ge 1000000) {
+                $supports1M = $true
+            }
+            [PSCustomObject]@{
+                Name = $name
+                Major = $major
+                Minor = $minor
+                Date = $date
+                Supports1M = $supports1M
+            }
+        }
+    }
+    $candidates | Sort-Object Major, Minor, Date -Descending | Select-Object -First 1
+}
+
+function Update-ClaudeModelMappings {
+    param([object]$Settings, [object[]]$Models)
+
+    foreach ($family in @('fable', 'opus', 'sonnet', 'haiku')) {
+        $latest = Select-LatestClaudeModel -Models $Models -Family $family
+        if (-not $latest) {
+            Write-Host "[WARN] 未找到 $family 系列的正式模型，保留该系列原配置。" -ForegroundColor Yellow
+            continue
+        }
+        $key = 'ANTHROPIC_DEFAULT_' + $family.ToUpperInvariant() + '_MODEL'
+        $modelId = $latest.Name
+        if ($latest.Supports1M) { $modelId += '[1M]' }
+        $Settings.env | Add-Member -NotePropertyName $key -NotePropertyValue $modelId -Force
+        $Settings.env | Add-Member -NotePropertyName ($key + '_NAME') -NotePropertyValue $latest.Name -Force
+        Write-Host "[OK] $family 模型已更新：$modelId" -ForegroundColor Green
+    }
+}
+
 $token = Read-Host "请粘贴你的 API Token (令牌密钥,从 $baseUrl 获取)"
 if ([string]::IsNullOrWhiteSpace($token)) {
     Write-Host "[FAIL] Token 不能为空" -ForegroundColor Red
@@ -144,13 +217,9 @@ if ($installed) {
     Write-Host "[..] 未检测到 Claude Code，开始安装..." -ForegroundColor Yellow
     Write-Host ""
 
-    $currentRegistry = (npm config get registry).Trim()
-    if ($currentRegistry -ne "https://registry.npmmirror.com" -and $currentRegistry -ne "https://registry.npmmirror.com/") {
-        Write-Host "正在设置 npm 镜像源..." -ForegroundColor Yellow
-        npm config set registry https://registry.npmmirror.com
-    }
-
-    npm install -g @anthropic-ai/claude-code
+    # 镜像源仅对本次安装生效，不修改用户的 npm 配置。
+    Write-Host "本次安装使用 npm 国内镜像源..." -ForegroundColor Yellow
+    npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com
 
     Write-Host ""
     Write-Host "正在验证安装结果..."
@@ -281,7 +350,7 @@ if (Test-Path $settingsPath2) {
     try {
         $settings = Get-Content -Path $settingsPath2 -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
-        $settings = [PSCustomObject]@{}
+        throw "无法解析 $settingsPath2，已停止写入，请修复 JSON 后重试。"
     }
 } else {
     $settings = [PSCustomObject]@{}
@@ -295,6 +364,16 @@ if (-not $settings.env) {
 # 写入 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN
 $settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $baseUrl -Force
 $settings.env | Add-Member -NotePropertyName "ANTHROPIC_AUTH_TOKEN" -NotePropertyValue $token -Force
+
+# 每次配置都获取当前 Token 可用的模型，不把某个版本永久写死在安装脚本里。
+Write-Host "正在获取最新可用的 Claude 模型..." -ForegroundColor Yellow
+try {
+    $availableModels = @(Get-ClaudeModels -BaseUrl $baseUrl -Token $token)
+    Update-ClaudeModelMappings -Settings $settings -Models $availableModels
+} catch {
+    # 不回显 HTTP 异常或响应正文，避免中转服务错误信息泄漏 Token。
+    Write-Host "[WARN] 获取模型列表失败，保留原有模型配置；API 地址和 Token 仍会更新。" -ForegroundColor Yellow
+}
 
 # 设置当前进程环境变量（供后续 claude 启动使用）
 $env:ANTHROPIC_BASE_URL = $baseUrl
