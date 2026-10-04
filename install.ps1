@@ -182,17 +182,8 @@ foreach ($var in $conflictVars) {
     $machineVal = [System.Environment]::GetEnvironmentVariable($var, "Machine")
     $userVal = [System.Environment]::GetEnvironmentVariable($var, "User")
 
-    if ($var -eq "ANTHROPIC_BASE_URL" -or $var -eq "ANTHROPIC_AUTH_TOKEN") {
-        if ($machineVal) {
-            $foundConflicts += "  [系统级] $var = $machineVal"
-        }
-        if ($userVal) {
-            $foundConflicts += "  [用户级] $var = $userVal (将被覆盖)"
-        }
-    } else {
-        if ($machineVal) { $foundConflicts += "  [系统级] $var = $machineVal" }
-        if ($userVal)    { $foundConflicts += "  [用户级] $var = $userVal" }
-    }
+    if ($machineVal) { $foundConflicts += "  [系统级] $var = $machineVal" }
+    if ($userVal)    { $foundConflicts += "  [用户级] $var = $userVal" }
 }
 
 if ($foundConflicts.Count -gt 0) {
@@ -202,7 +193,7 @@ if ($foundConflicts.Count -gt 0) {
     }
     Write-Host ""
 
-    $cleanVars = $conflictVars | Where-Object { $_ -ne "ANTHROPIC_BASE_URL" -and $_ -ne "ANTHROPIC_AUTH_TOKEN" }
+    $cleanVars = $conflictVars
     $hasStale = $false
     foreach ($var in $cleanVars) {
         $mv = [System.Environment]::GetEnvironmentVariable($var, "Machine")
@@ -260,13 +251,43 @@ if (Test-Path $settingsPath) {
     Write-Host "[OK] 未找到 settings.json。" -ForegroundColor Green
 }
 
+# 写入 settings.json
 Write-Host ""
-Write-Host "正在设置环境变量..." -ForegroundColor Yellow
-[System.Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $baseUrl, "User")
-[System.Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", $token, "User")
+Write-Host "正在写入配置到 settings.json..." -ForegroundColor Yellow
+$settingsDir = "$env:USERPROFILE\.claude"
+$settingsPath2 = "$settingsDir\settings.json"
+
+# 确保目录存在
+if (-not (Test-Path $settingsDir)) {
+    New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+}
+
+# 读取或创建 settings.json
+if (Test-Path $settingsPath2) {
+    try {
+        $settings = Get-Content -Path $settingsPath2 -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        $settings = [PSCustomObject]@{}
+    }
+} else {
+    $settings = [PSCustomObject]@{}
+}
+
+# 确保 env 字段存在
+if (-not $settings.env) {
+    $settings | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{}) -Force
+}
+
+# 写入 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN
+$settings.env | Add-Member -NotePropertyName "ANTHROPIC_BASE_URL" -NotePropertyValue $baseUrl -Force
+$settings.env | Add-Member -NotePropertyName "ANTHROPIC_AUTH_TOKEN" -NotePropertyValue $token -Force
+
+# 设置当前进程环境变量（供后续 claude 启动使用）
 $env:ANTHROPIC_BASE_URL = $baseUrl
 $env:ANTHROPIC_AUTH_TOKEN = $token
-Write-Host "[OK] 环境变量已设置。" -ForegroundColor Green
+
+$settings | ConvertTo-Json -Depth 10 | Set-Content -Path $settingsPath2 -Encoding UTF8
+Write-Host "[OK] 配置已写入 $settingsPath2" -ForegroundColor Green
 
 # 6. 启动 claude
 Write-Host ""
