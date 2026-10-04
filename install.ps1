@@ -41,83 +41,97 @@ if ([string]::IsNullOrWhiteSpace($token)) {
 }
 Write-Host ""
 
-# 1. 检查 Git (claude code 依赖 git-bash)
-$gitInstalled = Get-Command git -ErrorAction SilentlyContinue
-if ($gitInstalled) {
-    Write-Host "[OK] Git 已安装: $(git --version)" -ForegroundColor Green
-} else {
-    Write-Host "[..] 未检测到 Git，开始安装..." -ForegroundColor Yellow
+# Git 和 Node.js 安装包共用本次运行独立的临时目录。
+$tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+$tempDir = Join-Path $tempRoot ("claude-install-" + [guid]::NewGuid().ToString("N"))
+$tempDirCreated = $false
 
-    $gitVersion = "2.47.1.2"
-    $gitWinVersion = "v2.47.1.windows.2"
-    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
-        $gitExe = "Git-$gitVersion-arm64.exe"
+try {
+    New-Item -ItemType Directory -Path $tempDir -ErrorAction Stop | Out-Null
+    $tempDirCreated = $true
+
+    # 1. 检查 Git (claude code 依赖 git-bash)
+    $gitInstalled = Get-Command git -ErrorAction SilentlyContinue
+    if ($gitInstalled) {
+        Write-Host "[OK] Git 已安装: $(git --version)" -ForegroundColor Green
     } else {
-        $gitExe = "Git-$gitVersion-64-bit.exe"
+        Write-Host "[..] 未检测到 Git，开始安装..." -ForegroundColor Yellow
+
+        $gitVersion = "2.47.1.2"
+        $gitWinVersion = "v2.47.1.windows.2"
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+            $gitExe = "Git-$gitVersion-arm64.exe"
+        } else {
+            $gitExe = "Git-$gitVersion-64-bit.exe"
+        }
+        $gitUrl = "https://registry.npmmirror.com/-/binary/git-for-windows/$gitWinVersion/$gitExe"
+        $tempGit = Join-Path $tempDir $gitExe
+
+        Write-Host "正在下载 Git $gitVersion ..." -ForegroundColor Yellow
+        if (-not (Download-WithRetry -Url $gitUrl -Output $tempGit)) {
+            Write-Host "[FAIL] Git 下载失败" -ForegroundColor Red
+            Read-Host "按回车键退出"
+            exit
+        }
+
+        Write-Host "正在安装 Git ..." -ForegroundColor Yellow
+        Start-Process -FilePath $tempGit -ArgumentList "/VERYSILENT /NORESTART" -Wait -NoNewWindow
+
+        Refresh-Path
+
+        $gitCheck = Get-Command git -ErrorAction SilentlyContinue
+        if ($gitCheck) {
+            Write-Host "[OK] Git 安装成功: $(git --version)" -ForegroundColor Green
+        } else {
+            Write-Host "[FAIL] Git 安装失败" -ForegroundColor Red
+            Read-Host "按回车键退出"
+            exit
+        }
     }
-    $gitUrl = "https://registry.npmmirror.com/-/binary/git-for-windows/$gitWinVersion/$gitExe"
-    $tempGit = "$PSScriptRoot\$gitExe"
 
-    Write-Host "正在下载 Git $gitVersion ..." -ForegroundColor Yellow
-    if (-not (Download-WithRetry -Url $gitUrl -Output $tempGit)) {
-        Write-Host "[FAIL] Git 下载失败" -ForegroundColor Red
-        Read-Host "按回车键退出"
-        exit
-    }
-
-    Write-Host "正在安装 Git ..." -ForegroundColor Yellow
-    Start-Process -FilePath $tempGit -ArgumentList "/VERYSILENT /NORESTART" -Wait -NoNewWindow
-    Remove-Item -Force $tempGit -ErrorAction SilentlyContinue
-
-    Refresh-Path
-
-    $gitCheck = Get-Command git -ErrorAction SilentlyContinue
-    if ($gitCheck) {
-        Write-Host "[OK] Git 安装成功: $(git --version)" -ForegroundColor Green
+    # 2. 检查 Node.js
+    $nodeInstalled = Get-Command node -ErrorAction SilentlyContinue
+    if ($nodeInstalled) {
+        Write-Host "[OK] Node.js 已安装: $(node --version)" -ForegroundColor Green
     } else {
-        Write-Host "[FAIL] Git 安装失败" -ForegroundColor Red
-        Read-Host "按回车键退出"
-        exit
+        Write-Host "[..] 未检测到 Node.js，开始安装..." -ForegroundColor Yellow
+
+        $nodeVersion = "v22.15.0"
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+            $nodeArch = "arm64"
+        } else {
+            $nodeArch = "x64"
+        }
+        $nodeMsi = "node-$nodeVersion-$nodeArch.msi"
+        $nodeUrl = "https://cdn.npmmirror.com/binaries/node/$nodeVersion/$nodeMsi"
+        $tempMsi = Join-Path $tempDir $nodeMsi
+
+        Write-Host "正在下载 Node.js $nodeVersion ..." -ForegroundColor Yellow
+        if (-not (Download-WithRetry -Url $nodeUrl -Output $tempMsi)) {
+            Write-Host "[FAIL] Node.js 下载失败" -ForegroundColor Red
+            Read-Host "按回车键退出"
+            exit
+        }
+
+        Write-Host "正在安装 Node.js ..." -ForegroundColor Yellow
+        Start-Process msiexec.exe -ArgumentList "/i `"$tempMsi`" /qn /norestart" -Wait -NoNewWindow
+
+        Refresh-Path
+
+        $nodeCheck = Get-Command node -ErrorAction SilentlyContinue
+        if ($nodeCheck) {
+            Write-Host "[OK] Node.js 安装成功: $(node --version)" -ForegroundColor Green
+        } else {
+            Write-Host "[FAIL] Node.js 安装失败" -ForegroundColor Red
+            Read-Host "按回车键退出"
+            exit
+        }
     }
-}
 
-# 2. 检查 Node.js
-$nodeInstalled = Get-Command node -ErrorAction SilentlyContinue
-if ($nodeInstalled) {
-    Write-Host "[OK] Node.js 已安装: $(node --version)" -ForegroundColor Green
-} else {
-    Write-Host "[..] 未检测到 Node.js，开始安装..." -ForegroundColor Yellow
-
-    $nodeVersion = "v22.15.0"
-    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
-        $nodeArch = "arm64"
-    } else {
-        $nodeArch = "x64"
-    }
-    $nodeMsi = "node-$nodeVersion-$nodeArch.msi"
-    $nodeUrl = "https://cdn.npmmirror.com/binaries/node/$nodeVersion/$nodeMsi"
-    $tempMsi = "$PSScriptRoot\$nodeMsi"
-
-    Write-Host "正在下载 Node.js $nodeVersion ..." -ForegroundColor Yellow
-    if (-not (Download-WithRetry -Url $nodeUrl -Output $tempMsi)) {
-        Write-Host "[FAIL] Node.js 下载失败" -ForegroundColor Red
-        Read-Host "按回车键退出"
-        exit
-    }
-
-    Write-Host "正在安装 Node.js ..." -ForegroundColor Yellow
-    Start-Process msiexec.exe -ArgumentList "/i `"$tempMsi`" /qn /norestart" -Wait -NoNewWindow
-    Remove-Item -Force $tempMsi -ErrorAction SilentlyContinue
-
-    Refresh-Path
-
-    $nodeCheck = Get-Command node -ErrorAction SilentlyContinue
-    if ($nodeCheck) {
-        Write-Host "[OK] Node.js 安装成功: $(node --version)" -ForegroundColor Green
-    } else {
-        Write-Host "[FAIL] Node.js 安装失败" -ForegroundColor Red
-        Read-Host "按回车键退出"
-        exit
+} finally {
+    # 正常完成、提前退出或出错时，只清理本次创建的目录。
+    if ($tempDirCreated) {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
