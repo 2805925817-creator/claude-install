@@ -50,6 +50,32 @@ function Get-NodeDownloadSources {
     )
 }
 
+function Get-LatestNode24Version {
+    param([string]$Directory, [ValidateSet('x64', 'arm64')][string]$Architecture)
+    $manifestPath = Join-Path $Directory 'node24-latest-shasums.txt'
+    $sources = @(Get-NodeDownloadSources -Version 'latest-v24.x')
+    # 小型版本清单优先官方，防止镜像的 latest 别名滞后；包下载仍优先国内。
+    [array]::Reverse($sources)
+    try {
+        foreach ($source in $sources) {
+            Write-Host "正在查询 Node 24 最新正式版：$source" -ForegroundColor Yellow
+            if (-not (Download-WithRetry -Url "$source/SHASUMS256.txt" -Output $manifestPath -MaxRetries 1 -ConnectTimeout 8 -MaxTime 15)) {
+                continue
+            }
+            $pattern = '(?im)^[a-f0-9]{64}\s+\*?node-(v24\.\d+\.\d+)-' + [regex]::Escape($Architecture) + '\.msi\s*$'
+            $content = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8
+            $versions = @([regex]::Matches($content, $pattern) | ForEach-Object { $_.Groups[1].Value })
+            if ($versions.Count) {
+                return ($versions | Sort-Object { [version]$_.Substring(1) } -Descending | Select-Object -First 1)
+            }
+            Write-Host '[WARN] 版本清单不包含 Node 24 正式版安装包，切换查询源。' -ForegroundColor Yellow
+        }
+        throw '无法查询 Node 24 最新正式版，请检查网络或代理后重试。'
+    } finally {
+        Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Download-NodePackage {
     param(
         [ValidatePattern('^v\d+\.\d+\.\d+$')][string]$Version,
@@ -338,12 +364,14 @@ try {
     if (-not $nodeEnvironment.Ready) {
         Write-Host "[..] Node.js 版本不足或 npm 不可用，开始安装/修复..." -ForegroundColor Yellow
 
-        $nodeVersion = "v22.15.0"
         $repairArguments = ''
-        if ($nodeEnvironment.Node -and [version]$nodeEnvironment.Node.Version -ge [version]'22.15.0') {
+        if ($nodeEnvironment.Node -and [version]$nodeEnvironment.Node.Version -ge [version]'22.0.0') {
             # 已有更新版本但缺 npm 时修复同版本，避免静默降级。
             $nodeVersion = 'v' + $nodeEnvironment.Node.Version
             $repairArguments = ' REINSTALL=ALL REINSTALLMODE=vomus'
+        } else {
+            # 保留能用的 Node >=22；新装或低于 22 时使用最新 Node 24 正式版。
+            $nodeVersion = Get-LatestNode24Version -Directory $tempDir -Architecture $nodeArch
         }
         $nodeMsi = "node-$nodeVersion-$nodeArch.msi"
         $tempMsi = Join-Path $tempDir $nodeMsi

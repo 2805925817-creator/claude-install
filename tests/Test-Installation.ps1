@@ -74,8 +74,10 @@ try {
             @{ Version = '18.20.0'; Npm = $true; Ready = $false },
             @{ Version = '22.15.0'; Npm = $false; Ready = $false },
             @{ Version = $null; Npm = $true; Ready = $false },
+            @{ Version = '22.0.0'; Npm = $true; Ready = $true },
             @{ Version = '22.15.0'; Npm = $true; Ready = $true },
-            @{ Version = '24.0.0'; Npm = $true; Ready = $true }
+            @{ Version = '24.0.0'; Npm = $true; Ready = $true },
+            @{ Version = '26.0.0'; Npm = $true; Ready = $true }
         )) {
             $script:nodeVersion = $scenario.Version
             $script:hasNpm = $scenario.Npm
@@ -155,6 +157,44 @@ try {
         }
     }
 
+    # Node 24 动态版本查询：官方优先、镜像回退、版本排序和预发行过滤。
+    foreach ($scenario in @('official', 'mirror-fallback', 'invalid-manifest', 'all-offline')) {
+        & {
+            $script:versionUrls = @()
+            function Download-WithRetry {
+                param($Url, $Output, $MaxRetries, $ConnectTimeout, $MaxTime)
+                $script:versionUrls += $Url
+                Assert-True ($MaxRetries -eq 1 -and $ConnectTimeout -eq 8 -and $MaxTime -eq 15) '版本查询缺少短超时'
+                if ($scenario -eq 'all-offline' -or ($scenario -eq 'mirror-fallback' -and ([uri]$Url).Host -eq 'nodejs.org')) {
+                    return $false
+                }
+                $hash = 'a' * 64
+                $text = if ($scenario -eq 'invalid-manifest') { '<html>Access denied</html>' } else {
+                    # 输出故意未排序，并混入其他架构、其他大版本和预发行版。
+                    @(
+                        "$hash  node-v24.9.0-arm64.msi",
+                        "$hash  node-v24.21.0-arm64.msi",
+                        "$hash  node-v24.99.0-x64.msi",
+                        "$hash  node-v25.99.0-arm64.msi",
+                        "$hash  node-v24.99.0-rc.1-arm64.msi"
+                    ) -join "`n"
+                }
+                Set-Content -LiteralPath $Output -Encoding ASCII -Value $text
+                return $true
+            }
+            if ($scenario -in @('invalid-manifest', 'all-offline')) {
+                Assert-Fails { Get-LatestNode24Version -Directory $testRoot -Architecture 'arm64' } '无法查询 Node 24'
+                Assert-True ($script:versionUrls.Count -eq 3) '查询失败时未尝试全部来源'
+            } else {
+                Assert-True ((Get-LatestNode24Version -Directory $testRoot -Architecture 'arm64') -eq 'v24.21.0') '版本排序、架构或正式版过滤错误'
+                $expectedCalls = if ($scenario -eq 'official') { 1 } else { 2 }
+                Assert-True ($script:versionUrls.Count -eq $expectedCalls) '版本查询没有及时回退或成功后继续查询'
+            }
+            Assert-True (([uri]$script:versionUrls[0]).Host -eq 'nodejs.org') '最新版本查询没有优先官方'
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $testRoot 'node24-latest-shasums.txt'))) '版本查询临时文件没有清理'
+        }
+    }
+
     # 安装码，包括 Windows MSI 需要重启的成功码与取消/并发安装失败。
     & {
         function Test-IsAdministrator { return $false }
@@ -201,11 +241,13 @@ try {
     $dependencyStart = $source.IndexOf('# Git 和 Node.js 安装包共用')
     $dependencyEnd = $source.IndexOf('# 3. ', $dependencyStart)
     $dependencyBlock = $source.Substring($dependencyStart, $dependencyEnd - $dependencyStart)
-    foreach ($scenario in @('missing-bash', 'old-node', 'missing-npm-new-node', 'download-failure', 'postcheck-failure')) {
+    foreach ($scenario in @('missing-bash', 'existing-node22', 'existing-node24', 'missing-node', 'old-node', 'missing-npm-node22', 'missing-npm-new-node', 'version-failure', 'download-failure', 'postcheck-failure')) {
         & {
             $script:gitReady = $scenario -ne 'missing-bash'
-            $script:nodeReady = $scenario -eq 'missing-bash'
+            $script:nodeReady = $scenario -in @('missing-bash', 'existing-node22', 'existing-node24')
             $script:installCalls = @()
+            $script:versionQueries = 0
+            $script:downloadUrl = $null
             $nodeArch = 'arm64'; $gitArch = 'arm64'
             function Get-WorkingCommand { param($Names, $VersionPattern)
                 [PSCustomObject]@{ Path = 'C:\Git\cmd\git.exe'; Version = '2.47.1' }
@@ -214,8 +256,15 @@ try {
                 if ($script:gitReady) { return 'C:\Git\bin\bash.exe' }
             }
             function Get-NodeEnvironment {
-                $version = if ($scenario -eq 'missing-npm-new-node') { '24.0.0' } elseif ($script:nodeReady) { '22.15.0' } else { '18.20.0' }
-                [PSCustomObject]@{ Node = [PSCustomObject]@{ Path = 'C:\Node\node.exe'; Version = $version }; Npm = [PSCustomObject]@{ Version = '10.9.0' }; Ready = $script:nodeReady }
+                $version = if ($scenario -eq 'missing-npm-new-node') { '26.0.0' } elseif ($scenario -eq 'missing-npm-node22') { '22.0.0' } elseif ($scenario -eq 'existing-node24' -or $script:installCalls -contains 'Node.js') { '24.21.0' } elseif ($script:nodeReady) { '22.15.0' } else { '18.20.0' }
+                $node = if ($scenario -ne 'missing-node' -or $script:nodeReady) { [PSCustomObject]@{ Path = 'C:\Node\node.exe'; Version = $version } } else { $null }
+                [PSCustomObject]@{ Node = $node; Npm = [PSCustomObject]@{ Version = '10.9.0' }; Ready = $script:nodeReady }
+            }
+            function Get-LatestNode24Version { param($Directory, $Architecture)
+                $script:versionQueries++
+                $script:dependencyTempDir = $Directory
+                if ($scenario -eq 'version-failure') { throw '无法查询 Node 24 最新正式版' }
+                return 'v24.21.0'
             }
             function Download-WithRetry { param($Url, $Output)
                 $script:downloadUrl = $Url
@@ -234,22 +283,38 @@ try {
                 if ($Name -eq 'Node.js' -and $scenario -ne 'postcheck-failure') { $script:nodeReady = $true }
             }
             function Refresh-Path { }
-            if ($scenario -eq 'download-failure') {
+            if ($scenario -eq 'version-failure') {
+                Assert-Fails { Invoke-Expression $dependencyBlock } '无法查询 Node 24'
+                Assert-True ($script:installCalls.Count -eq 0 -and $null -eq $script:downloadUrl) '版本查询失败后仍下载或安装'
+            } elseif ($scenario -eq 'download-failure') {
                 Assert-Fails { Invoke-Expression $dependencyBlock } '下载失败'
                 Assert-True ($script:installCalls.Count -eq 0) '下载失败后仍安装'
             } elseif ($scenario -eq 'postcheck-failure') {
                 Assert-Fails { Invoke-Expression $dependencyBlock } '安装后验证失败'
             } else {
                 Invoke-Expression $dependencyBlock
-                Assert-True ($script:installCalls.Count -eq 1) '依赖修复分支不正确'
+                $expectedInstalls = if ($scenario -like 'existing-node*') { 0 } else { 1 }
+                Assert-True ($script:installCalls.Count -eq $expectedInstalls) '依赖修复或保留已有 Node 分支不正确'
                 if ($scenario -eq 'missing-bash') {
                     Assert-True ($script:installCalls[0] -eq 'Git' -and $script:installerArgs -match '/ALLUSERS') '缺 Bash 未安装完整 Git'
                 }
                 if ($scenario -eq 'missing-npm-new-node') {
-                    Assert-True ($script:downloadUrl -match 'v24.0.0.*arm64' -and $script:installerArgs -match 'REINSTALL=ALL') 'npm 修复降级 Node 或架构错误'
+                    Assert-True ($script:downloadUrl -match 'v26.0.0.*arm64' -and $script:installerArgs -match 'REINSTALL=ALL') 'npm 修复降级 Node 或架构错误'
+                }
+                if ($scenario -eq 'missing-npm-node22') {
+                    Assert-True ($script:downloadUrl -match 'v22.0.0.*arm64' -and $script:installerArgs -match 'REINSTALL=ALL') 'npm 修复未保留 Node 22 同版本'
+                }
+                if ($scenario -in @('missing-node', 'old-node')) {
+                    Assert-True ($script:downloadUrl -match 'v24.21.0.*arm64' -and $script:installerArgs -notmatch 'REINSTALL=ALL') '新装或升级未使用最新 Node 24 或误用修复参数'
                 }
             }
-            Assert-True (-not (Test-Path -LiteralPath $script:dependencyTempDir)) '失败或成功后未清理临时目录'
+            $expectedQueries = if ($scenario -in @('missing-node', 'old-node', 'version-failure', 'download-failure', 'postcheck-failure')) { 1 } else { 0 }
+            Assert-True ($script:versionQueries -eq $expectedQueries) '正常或同版本修复时仍查询 Node 24'
+            if ($scenario -like 'existing-node*') {
+                Assert-True ($null -eq $script:downloadUrl) '已有 Node >=22 且 npm 正常仍下载了安装包'
+            } else {
+                Assert-True (-not (Test-Path -LiteralPath $script:dependencyTempDir)) '失败或成功后未清理临时目录'
+            }
         }
     }
 
