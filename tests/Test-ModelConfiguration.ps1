@@ -94,12 +94,14 @@ $configBlock = $source.Substring($start, $end - $start).Replace(
     '$settingsDir = "$env:USERPROFILE\.claude"', '$settingsDir = $testSettingsDir')
 $baseUrl = 'https://tdyun.ai'
 $token = 'test-token'
+$gitBash = 'C:\Test Git\bin\bash.exe'
 try {
     $script:mode = 'success'
     Invoke-Expression $configBlock
     $file = Join-Path $testSettingsDir 'settings.json'
     $written = Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ($written.env.ANTHROPIC_DEFAULT_FABLE_MODEL -eq 'claude-fable-5-1[1M]') '全新配置未写入模型'
+    Assert-True ($written.env.CLAUDE_CODE_GIT_BASH_PATH -eq $gitBash) 'Git Bash 路径未保存到配置'
 
     $written | Add-Member -NotePropertyName model -NotePropertyValue 'claude-opus-4-8' -Force
     $written.env | Add-Member -NotePropertyName ANTHROPIC_MODEL -NotePropertyValue 'sonnet' -Force
