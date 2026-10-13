@@ -50,6 +50,57 @@ function Get-NodeDownloadSources {
     )
 }
 
+function Get-NpmRegistrySources {
+    # 国内镜像优先，不同运营方提供容灾，最后回退到官方源。
+    return @(
+        "https://registry.npmmirror.com",
+        "https://mirrors.huaweicloud.com/repository/npm",
+        "https://mirrors.cloud.tencent.com/npm",
+        "https://registry.npmjs.org"
+    )
+}
+
+function Remove-StaleClaudeNpmDirs {
+    param([string]$NpmPrefix)
+    # npm 中断后会残留 .claude-code-* 暂存目录，下次安装报 ENOTEMPTY。
+    $scopeDir = Join-Path $NpmPrefix 'node_modules\@anthropic-ai'
+    if (-not (Test-Path -LiteralPath $scopeDir -PathType Container)) { return }
+    Get-ChildItem -LiteralPath $scopeDir -Directory -Force -Filter '.claude-code-*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Install-ClaudeCodePackage {
+    param([string]$NpmPath, [string]$NpmPrefix)
+    # 不能命名为 $lastExitCode：PowerShell 变量名不区分大小写，会遮蔽 $LASTEXITCODE。
+    $npmExitCode = $null
+    $installedButBroken = $false
+    foreach ($registry in @(Get-NpmRegistrySources)) {
+        Write-Host "正在尝试 npm 源：$registry" -ForegroundColor Yellow
+        Remove-StaleClaudeNpmDirs -NpmPrefix $NpmPrefix
+        # 源和下列参数仅对本次安装生效，不修改用户的 npm 配置。
+        # 原生二进制约 250MB，通过 optionalDependencies + postinstall 安装，必须强制包含两者。
+        & $NpmPath install -g @anthropic-ai/claude-code "--registry=$registry" `
+            --include=optional --ignore-scripts=false --no-audit --no-fund `
+            --fetch-retries=4 --fetch-retry-mintimeout=10000 --fetch-retry-maxtimeout=60000 --fetch-timeout=600000 |
+            Out-Host
+        $npmExitCode = $LASTEXITCODE
+        if ($npmExitCode -ne 0) {
+            Write-Host "[WARN] 该源安装失败（退出码 $npmExitCode），切换下一个源。" -ForegroundColor Yellow
+            continue
+        }
+        # 镜像缺少平台二进制时 npm 仍返回 0，只留下占位文件，所以每个源都要实际验证。
+        $claude = Get-WorkingCommand -Names @('claude.cmd', 'claude.exe') -VersionPattern '^(\d+\.\d+\.\d+).*\(Claude Code\)'
+        if ($claude) { return $claude }
+        $installedButBroken = $true
+        Write-Host "[WARN] 该源安装完成但 claude --version 验证失败，切换下一个源。" -ForegroundColor Yellow
+    }
+    $manual = '可手动执行：npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com'
+    if ($installedButBroken) {
+        throw "Claude Code 安装后无法通过 --version 验证，请检查 npm 全局安装目录、PATH 和安全软件拦截。$manual"
+    }
+    throw "Claude Code npm 安装失败，所有源均未成功，最后退出码 $npmExitCode。请检查网络、代理、npm prefix 和目录写入权限。$manual"
+}
+
 function Get-LatestNode24Version {
     param([string]$Directory, [ValidateSet('x64', 'arm64')][string]$Architecture)
     $manifestPath = Join-Path $Directory 'node24-latest-shasums.txt'
@@ -412,11 +463,7 @@ $env:Path = "$npmPrefix;$env:Path"
 $claude = Get-WorkingCommand -Names @('claude.cmd', 'claude.exe') -VersionPattern '^(\d+\.\d+\.\d+).*\(Claude Code\)'
 if (-not $claude) {
     Write-Host "[..] Claude Code 缺失或无法运行，开始安装/修复..." -ForegroundColor Yellow
-    # 镜像源仅对本次安装生效，不修改用户的 npm 配置。
-    & $npmPath install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com
-    if ($LASTEXITCODE -ne 0) { throw "Claude Code npm 安装失败，退出码 $LASTEXITCODE。请检查网络、npm prefix 和目录写入权限。" }
-    $claude = Get-WorkingCommand -Names @('claude.cmd', 'claude.exe') -VersionPattern '^(\d+\.\d+\.\d+).*\(Claude Code\)'
-    if (-not $claude) { throw 'Claude Code 安装后无法通过 --version 验证，请检查 npm 全局安装目录和 PATH。' }
+    $claude = Install-ClaudeCodePackage -NpmPath $npmPath -NpmPrefix $npmPrefix
 }
 # 同步用户 PATH，后续新开的终端也能找到自定义 prefix 中的命令。
 Add-UserPath -Directory $npmPrefix

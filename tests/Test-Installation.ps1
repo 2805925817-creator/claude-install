@@ -322,10 +322,11 @@ try {
     $claudeStart = $source.IndexOf('# 3. ')
     $claudeEnd = $source.IndexOf('# 5. ', $claudeStart)
     $claudeBlock = $source.Substring($claudeStart, $claudeEnd - $claudeStart)
-    foreach ($scenario in @('existing', 'repair', 'npm-failure', 'broken-after-install', 'prefix-failure')) {
+    foreach ($scenario in @('existing', 'repair', 'npm-failure', 'registry-fallback', 'broken-after-install', 'prefix-failure')) {
         & {
             $script:claudeReady = $scenario -eq 'existing'
             $script:npmInstalls = 0
+            $script:registriesTried = @()
             $script:pathAdded = $null
             $nodeEnvironment = [PSCustomObject]@{ Npm = [PSCustomObject]@{ Path = 'Test-Npm' } }
             function Test-Npm {
@@ -333,10 +334,19 @@ try {
                     $global:LASTEXITCODE = if ($scenario -eq 'prefix-failure') { 1 } else { 0 }
                     return 'C:\Custom Npm'
                 }
-                Assert-True ($args -contains '--registry=https://registry.npmmirror.com') 'npm 源不再仅对本次生效'
+                $registryArg = @($args | Where-Object { $_ -like '--registry=*' })[0]
+                Assert-True ($null -ne $registryArg) '未指定 npm 源，可能污染了用户全局配置'
+                Assert-True ($args -contains '--include=optional' -and $args -contains '--ignore-scripts=false') '未强制安装原生二进制'
+                # 输出的文本不能混入函数返回值。
+                'npm noise'
+                $registry = $registryArg -replace '^--registry=', ''
+                $script:registriesTried += $registry
                 $script:npmInstalls++
-                $global:LASTEXITCODE = if ($scenario -eq 'npm-failure') { 1 } else { 0 }
-                $script:claudeReady = $scenario -ne 'broken-after-install'
+                # registry-fallback 场景下只有第一个源失败，其余源应成功。
+                $global:LASTEXITCODE = if ($scenario -eq 'npm-failure') { 1 }
+                    elseif ($scenario -eq 'registry-fallback' -and $script:npmInstalls -eq 1) { 1 }
+                    else { 0 }
+                if ($global:LASTEXITCODE -eq 0) { $script:claudeReady = $scenario -ne 'broken-after-install' }
             }
             function Get-WorkingCommand { param($Names, $VersionPattern)
                 Assert-True ($env:Path.StartsWith('C:\Custom Npm;')) '验证前未加入自定义 prefix'
@@ -344,16 +354,31 @@ try {
             }
             function Add-UserPath { param($Directory) $script:pathAdded = $Directory }
             switch ($scenario) {
-                'npm-failure' { Assert-Fails { Invoke-Expression $claudeBlock } 'npm 安装失败' }
-                'broken-after-install' { Assert-Fails { Invoke-Expression $claudeBlock } '--version' }
+                'npm-failure' {
+                    Assert-Fails { Invoke-Expression $claudeBlock } 'npm 安装失败'
+                    Assert-True ($script:npmInstalls -eq 4) '未遍历全部 npm 源就放弃'
+                    Assert-True (($script:registriesTried | Select-Object -Unique).Count -eq 4) '多次使用了同一个 npm 源'
+                    Assert-True ($script:registriesTried[0] -eq 'https://registry.npmmirror.com') '未优先使用国内镜像'
+                }
+                'registry-fallback' {
+                    Invoke-Expression $claudeBlock
+                    Assert-True ($script:npmInstalls -eq 2) '第一个源失败后未及时切换到下一个源'
+                    Assert-True ($script:pathAdded -eq 'C:\Custom Npm') '切换源成功后未持久化自定义 PATH'
+                    Assert-True ($claude -isnot [array] -and $claude.Version -eq '2.1.0') 'npm 输出混入了 Claude 检测结果'
+                }
+                'broken-after-install' {
+                    Assert-Fails { Invoke-Expression $claudeBlock } '--version'
+                    Assert-True ($script:npmInstalls -eq 4) '安装后验证失败时未换源重试'
+                }
                 'prefix-failure' { Assert-Fails { Invoke-Expression $claudeBlock } '全局安装目录' }
                 default {
                     Invoke-Expression $claudeBlock
                     Assert-True ($script:pathAdded -eq 'C:\Custom Npm') '未持久化自定义 PATH'
                     Assert-True ($script:npmInstalls -eq [int]($scenario -eq 'repair')) '已有 Claude 被重复安装或损坏命令未修复'
+                    Assert-True ($claude -isnot [array] -and $claude.Version -eq '2.1.0') 'npm 输出混入了 Claude 检测结果'
                 }
             }
-            if ($scenario -match 'failure|broken') { Assert-True ($null -eq $script:pathAdded) '失败时仍报告安装成功' }
+            if ($scenario -match 'npm-failure|broken|prefix-failure') { Assert-True ($null -eq $script:pathAdded) '失败时仍报告安装成功' }
         }
     }
 } finally {

@@ -17,7 +17,14 @@ Claude Code 必须通过 `--version` 验证才判定成功，自定义 npm 全�
 Git 和 Node.js 安装包统一下载到系统临时目录下的 `claude-install-<随机 ID>` 子目录。
 每次运行使用独立目录，兼容本地脚本和远程执行；依赖安装完成、提前退出或发生错误时自动清理。
 
-Claude Code 安装通过命令行参数临时使用 npm 国内镜像源，安装成功或失败都保留用户原有的 npm 源配置。
+Claude Code 安装通过命令行参数临时指定 npm 源，安装成功或失败都保留用户原有的 npm 源配置。按顺序尝试 npmmirror、华为云、腾讯云、npm 官方源；npm 失败或安装后 `claude --version` 验证失败都会换下一个源。
+Claude Code 的原生二进制（约 250MB）通过 optionalDependencies 和 postinstall 安装，脚本强制 `--include=optional --ignore-scripts=false`，避免用户 npmrc 中的 `omit=optional` 或 `ignore-scripts=true` 导致只装上占位文件；同时加大 npm 下载重试次数和超时，并在每次尝试前清理上次中断残留的 `.claude-code-*` 暂存目录（否则会报 ENOTEMPTY）。
+
+脚本安装失败时，可在普通 PowerShell 中手动执行：
+
+```powershell
+npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com
+```
 
 配置时覆盖 `~/.claude/settings.json` 中的 API 地址和 Token，并使用本次输入的 Token 从 `https://tdyun.ai/v1/models` 获取可用模型。
 按版本号为 Fable、Opus、Sonnet、Haiku 各选一个最新正式版本（跳过 `-thinking` 等变体），覆盖对应的 `ANTHROPIC_DEFAULT_*_MODEL` 和 `ANTHROPIC_DEFAULT_*_MODEL_NAME`。
