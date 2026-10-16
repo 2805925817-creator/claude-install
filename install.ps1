@@ -230,6 +230,19 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-DesktopUserSid {
+    # 当前会话桌面（explorer.exe）的所有者即实际登录用户；无法判断时返回 $null。
+    try {
+        $sessionId = (Get-Process -Id $PID).SessionId
+        foreach ($shell in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+            if ($shell.SessionId -ne $sessionId) { continue }
+            $owner = Invoke-CimMethod -InputObject $shell -MethodName GetOwnerSid -ErrorAction Stop
+            if ($owner.ReturnValue -eq 0 -and $owner.Sid) { return $owner.Sid }
+        }
+    } catch { }
+    return $null
+}
+
 function Invoke-Installer {
     param([string]$FilePath, [string]$Arguments, [string]$Name, [int[]]$SuccessCodes = @(0))
     $options = @{ FilePath = $FilePath; ArgumentList = $Arguments; Wait = $true; PassThru = $true; ErrorAction = 'Stop' }
@@ -353,8 +366,15 @@ function Update-ClaudeModelMappings {
 
 try {
 # 由实际使用 Claude 的用户运行；只有依赖安装包请求 UAC。
+# 管理员窗口仅在提权账户与桌面登录用户不同时停止（UAC 输入了其他管理员账户）；
+# 登录用户本身就是管理员（如内置 Administrator）时配置写入的就是自己，可以继续。
 if (Test-IsAdministrator) {
-    throw '请在普通权限窗口运行此脚本，以免将 npm 和 Claude 配置写入管理员账户。Git/Node 安装时会单独请求 UAC 授权。'
+    $desktopUserSid = Get-DesktopUserSid
+    $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ($desktopUserSid -and $desktopUserSid -ne $currentUserSid) {
+        throw '当前管理员窗口属于另一个账户，继续会把 npm 和 Claude 配置写入该账户。请在普通权限窗口运行此脚本，Git/Node 安装时会单独请求 UAC 授权。'
+    }
+    Write-Host '[INFO] 已以管理员身份运行，配置将写入当前登录账户。' -ForegroundColor Cyan
 }
 Refresh-Path
 $architecture = $env:PROCESSOR_ARCHITEW6432

@@ -27,16 +27,26 @@ $savedBash = $env:CLAUDE_CODE_GIT_BASH_PATH
 $savedArchitecture = $env:PROCESSOR_ARCHITECTURE
 $savedNativeArchitecture = $env:PROCESSOR_ARCHITEW6432
 try {
-    # 管理员入口必须在读取 Token、安装和配置写入前停止；32 位宿主按原生架构选包。
+    # 提权账户与桌面用户不同时必须在读取 Token 前停止；同一账户（如内置 Administrator）可继续。
+    # 32 位宿主按原生架构选包。
     & {
         function Test-IsAdministrator { return $script:isAdministrator }
+        function Get-DesktopUserSid { return $script:desktopUserSid }
         function Refresh-Path { }
+        function Write-Host { }
         $start = $source.IndexOf('# 由实际使用 Claude 的用户运行')
         $end = $source.IndexOf('$token = Read-Host', $start)
         $preflight = $source.Substring($start, $end - $start)
+        $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $script:isAdministrator = $true
-        Assert-Fails { Invoke-Expression $preflight } '普通权限'
+        $script:desktopUserSid = 'S-1-5-21-0-0-0-1001'
+        Assert-Fails { Invoke-Expression $preflight } '另一个账户'
+        $script:desktopUserSid = $currentSid
+        Invoke-Expression $preflight
+        $script:desktopUserSid = $null
+        Invoke-Expression $preflight
         $script:isAdministrator = $false
+        $script:desktopUserSid = 'S-1-5-21-0-0-0-1001'
         $env:PROCESSOR_ARCHITECTURE = 'x86'
         $env:PROCESSOR_ARCHITEW6432 = 'AMD64'
         Invoke-Expression $preflight
